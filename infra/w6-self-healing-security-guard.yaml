@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  W6 Self-Healing Security Guard template.
+  This template provisions a Lambda function, a least-privilege IAM role,
+  an EventBridge rule, and Lambda invoke permission. The Lambda revokes
+  Security Group ingress rules that expose SSH/RDP to the public internet.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: CarShowroom
+    Description: Application tag value.
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment tag value.
+
+  CostCenter:
+    Type: String
+    Default: G2
+    Description: Cost center or group ID.
+
+  Owner:
+    Type: String
+    Default: teamlead@example.com
+    Description: Owner tag value.
+
+Resources:
+  SecurityGuardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/w6-security-group-self-healing-guard-cfn
+      RetentionInDays: 7
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  SecurityGuardLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Least-privilege role for the W6 Security Group self-healing Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: w6-security-guard-lambda-policy-cfn
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DescribeAndRevokeDangerousSecurityGroupIngress
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: "*"
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${SecurityGuardLogGroup.Arn}:*"
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  SecurityGuardLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SecurityGuardLogGroup
+      - SecurityGuardLambdaRole
+    Properties:
+      FunctionName: w6-security-group-self-healing-guard-cfn
+      Description: Revokes public SSH/RDP ingress rules from Security Groups.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityGuardLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          ec2 = boto3.client("ec2")
+
+          DANGEROUS_PORTS = {22, 3389}
+          DANGEROUS_IPV4 = "0.0.0.0/0"
+          DANGEROUS_IPV6 = "::/0"
+
+          def is_dangerous_permission(permission):
+              protocol = permission.get("IpProtocol")
+
+              if protocol != "tcp":
+                  return False
+
+              from_port = permission.get("FromPort")
+              to_port = permission.get("ToPort")
+
+              if from_port is None or to_port is None:
+                  return False
+
+              port_is_dangerous = any(from_port <= port <= to_port for port in DANGEROUS_PORTS)
+
+              if not port_is_dangerous:
+                  return False
+
+              ipv4_open = any(
+                  ip_range.get("CidrIp") == DANGEROUS_IPV4
+                  for ip_range in permission.get("IpRanges", [])
+              )
+
+              ipv6_open = any(
+                  ip_range.get("CidrIpv6") == DANGEROUS_IPV6
+                  for ip_range in permission.get("Ipv6Ranges", [])
+              )
+
+              return ipv4_open or ipv6_open
+
+          def build_revoke_permission(permission):
+              revoke_permission = {
+                  "IpProtocol": permission["IpProtocol"],
+                  "FromPort": permission["FromPort"],
+                  "ToPort": permission["ToPort"],
+              }
+
+              dangerous_ipv4_ranges = [
+                  {"CidrIp": ip_range["CidrIp"]}
+                  for ip_range in permission.get("IpRanges", [])
+                  if ip_range.get("CidrIp") == DANGEROUS_IPV4
+              ]
+
+              dangerous_ipv6_ranges = [
+                  {"CidrIpv6": ip_range["CidrIpv6"]}
+                  for ip_range in permission.get("Ipv6Ranges", [])
+                  if ip_range.get("CidrIpv6") == DANGEROUS_IPV6
+              ]
+
+              if dangerous_ipv4_ranges:
+                  revoke_permission["IpRanges"] = dangerous_ipv4_ranges
+
+              if dangerous_ipv6_ranges:
+                  revoke_permission["Ipv6Ranges"] = dangerous_ipv6_ranges
+
+              return revoke_permission
+
+          def lambda_handler(event, context):
+              print("Received event:")
+              print(json.dumps(event, default=str))
+
+              remediated_rules = []
+
+              try:
+                  paginator = ec2.get_paginator("describe_security_groups")
+
+                  for page in paginator.paginate():
+                      for sg in page.get("SecurityGroups", []):
+                          group_id = sg["GroupId"]
+                          group_name = sg.get("GroupName", "")
+
+                          for permission in sg.get("IpPermissions", []):
+                              if not is_dangerous_permission(permission):
+                                  continue
+
+                              revoke_permission = build_revoke_permission(permission)
+
+                              print(
+                                  f"Revoking dangerous ingress from SG {group_id} "
+                                  f"({group_name}): {json.dumps(revoke_permission)}"
+                              )
+
+                              try:
+                                  ec2.revoke_security_group_ingress(
+                                      GroupId=group_id,
+                                      IpPermissions=[revoke_permission]
+                                  )
+
+                                  remediated_rules.append({
+                                      "GroupId": group_id,
+                                      "GroupName": group_name,
+                                      "RevokedPermission": revoke_permission
+                                  })
+
+                              except ClientError as revoke_error:
+                                  error_code = revoke_error.response["Error"].get("Code")
+                                  print(f"Failed to revoke rule from {group_id}: {revoke_error}")
+
+                                  if error_code != "InvalidPermission.NotFound":
+                                      raise
+
+                  result = {
+                      "status": "completed",
+                      "remediated_count": len(remediated_rules),
+                      "remediated_rules": remediated_rules
+                  }
+
+                  print(json.dumps(result, default=str))
+                  return result
+
+              except Exception as error:
+                  print(f"Security guard failed: {error}")
+                  raise
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  SecurityGroupIngressEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: w6-detect-public-ssh-rdp-ingress-cfn
+      Description: Trigger the security guard when Security Group ingress is authorized.
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+      Targets:
+        - Id: SecurityGuardLambdaTarget
+          Arn: !GetAtt SecurityGuardLambda.Arn
+
+  AllowEventBridgeInvokeSecurityGuard:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGuardLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupIngressEventRule.Arn
+
+Outputs:
+  SecurityGuardLambdaName:
+    Description: Name of the self-healing security guard Lambda function.
+    Value: !Ref SecurityGuardLambda
+
+  SecurityGuardLambdaArn:
+    Description: ARN of the self-healing security guard Lambda function.
+    Value: !GetAtt SecurityGuardLambda.Arn
+
+  SecurityGuardRoleArn:
+    Description: ARN of the least-privilege Lambda execution role.
+    Value: !GetAtt SecurityGuardLambdaRole.Arn
+
+  EventBridgeRuleName:
+    Description: EventBridge rule that triggers the security guard.
+    Value: !Ref SecurityGroupIngressEventRule
