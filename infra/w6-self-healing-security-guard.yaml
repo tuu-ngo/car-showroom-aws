@@ -23,7 +23,7 @@ Parameters:
 
   Owner:
     Type: String
-    Default: teamlead@example.com
+    Default: huutai.ngo2409@gmail.com
     Description: Owner tag value.
 
 Resources:
